@@ -8,6 +8,7 @@ upstream's — the fork adds an HTTP transport and container packaging on top
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Optional
 
@@ -35,6 +36,10 @@ ITEM_URL = f"{BASE}/buy/browse/v1/item"
 
 # In-memory token cache (process-local).
 _token_cache: dict[str, object] = {"value": None, "expires_at": 0.0}
+# FastMCP runs the sync tools in a thread pool; the lock dedupes concurrent
+# token refreshes so an agent burst with an expired cache fires one OAuth
+# token request, not one per call (token endpoints are rate-limited too).
+_token_lock = threading.Lock()
 
 
 def credentials_configured() -> bool:
@@ -56,25 +61,30 @@ def _get_access_token() -> str:
     if _token_cache["value"] and now < _token_cache["expires_at"]:  # type: ignore[operator]
         return _token_cache["value"]  # type: ignore[return-value]
 
-    response = requests.post(
-        TOKEN_URL,
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "client_credentials",
-            "scope": "https://api.ebay.com/oauth/api_scope",
-        },
-        timeout=10,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Token request failed ({response.status_code}): {response.text[:300]}"
+    with _token_lock:
+        # Re-check under the lock: another thread may have refreshed while we waited.
+        now = time.time()
+        if _token_cache["value"] and now < _token_cache["expires_at"]:  # type: ignore[operator]
+            return _token_cache["value"]  # type: ignore[return-value]
+        response = requests.post(
+            TOKEN_URL,
+            auth=(CLIENT_ID, CLIENT_SECRET),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "client_credentials",
+                "scope": "https://api.ebay.com/oauth/api_scope",
+            },
+            timeout=10,
         )
-    payload = response.json()
-    _token_cache["value"] = payload["access_token"]
-    # 60s safety margin before actual expiry.
-    _token_cache["expires_at"] = now + payload["expires_in"] - 60
-    return _token_cache["value"]  # type: ignore[return-value]
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Token request failed ({response.status_code}): {response.text[:300]}"
+            )
+        payload = response.json()
+        _token_cache["value"] = payload["access_token"]
+        # 60s safety margin before actual expiry.
+        _token_cache["expires_at"] = now + payload["expires_in"] - 60
+        return _token_cache["value"]  # type: ignore[return-value]
 
 
 def _headers(token: str) -> dict[str, str]:

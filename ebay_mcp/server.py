@@ -30,9 +30,36 @@ from ebay_mcp.ebay_client import (
 
 log = logging.getLogger("ebay-mcp")
 
+
+def _coerce_int(
+    value: str | int | None, field: str, *, ge: int | None = None
+) -> int | None:
+    """Coerce the numeric strings LLMs routinely send for int parameters.
+
+    FastMCP validates tool input against the JSON schema before the function
+    runs, so a parameter typed ``int`` rejects the string ``"10"`` outright
+    (the same bug fixed in kleinanzeigen-mcp 0.1.1, geizhals-mcp 0.1.3 and
+    aliexpress-mcp 0.1.1). Accepting ``str | int`` in the schema and
+    normalising here keeps the model-facing contract lenient while the client
+    still sees a real int.
+    """
+    if value is None or isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+    else:
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    if ge is not None and result is not None and result < ge:
+        raise ValueError(f"{field} must be >= {ge}, got {result}")
+    return result
+
+
 mcp = FastMCP(
     name="ebay",
-    version="0.1.0",
+    version="0.1.1",
     instructions=(
         "Search eBay listings via the official Browse API. The marketplace is "
         f"{MARKETPLACE} (e.g. EBAY_DE = ebay.de), so titles, prices and sellers "
@@ -57,7 +84,7 @@ def search_ebay(
         Field(description="Search keywords, e.g. 'ThinkPad T14 AMD' or 'Rolex Datejust'"),
     ],
     limit: Annotated[
-        int, Field(description="Maximum results to return", ge=1, le=200)
+        str | int, Field(description="Maximum results to return")
     ] = 10,
     filter_expr: Annotated[
         Optional[str],
@@ -87,6 +114,7 @@ def search_ebay(
     location, thumbnail and URL. Pass an item's `item_id` to `get_item_details`
     for the full record. Prices and currency follow the configured marketplace.
     """
+    limit = min(_coerce_int(limit, "limit", ge=1) or 10, 200)
     raw = search_items(query=query, limit=limit, filter_expr=filter_expr, sort=sort)
 
     items = []
