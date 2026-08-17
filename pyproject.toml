@@ -1,6 +1,6 @@
 [project]
 name = "ebay-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "MCP server for eBay listing search via the Browse API"
 readme = "README.md"
 requires-python = ">=3.12"
