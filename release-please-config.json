@@ -5,7 +5,8 @@
       "release-type": "python",
       "package-name": "ebay-mcp",
       "changelog-path": "CHANGELOG.md",
-      "last-release-sha": "ff0dc615ea4604dc7c8c1577f344c598e03f34d5"
+      "last-release-sha": "ff0dc615ea4604dc7c8c1577f344c598e03f34d5",
+      "include-component-in-tag": false
     }
   }
 }
