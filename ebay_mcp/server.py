@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from importlib.metadata import PackageNotFoundError, version
 from typing import Annotated, Any, Optional
 
@@ -63,6 +64,32 @@ def _coerce_int(
             raise ValueError(f"{field} must be an integer, got {value!r}") from exc
     else:
         raise ValueError(f"{field} must be an integer, got {value!r}")
+    if ge is not None and result is not None and result < ge:
+        raise ValueError(f"{field} must be >= {ge}, got {result}")
+    return result
+
+
+def _coerce_float(
+    value: str | int | float | None, field: str, *, ge: float | None = None
+) -> float | None:
+    """Coerce the numeric strings LLMs routinely send for float parameters.
+
+    Same rationale as ``_coerce_int`` above (FastMCP's schema-level ``float``
+    type rejects the string ``"99.99"`` outright, before this function ever
+    runs) applied to prices, which are rarely whole numbers so ``_coerce_int``
+    itself won't do. Mirrors the ``_coerce_float`` already shipped in
+    aliexpress-mcp 0.1.x and amazon-mcp so the coercion contract is identical
+    across every sibling server that takes a price.
+    """
+    if value is None or isinstance(value, (int, float)):
+        result = float(value) if value is not None else None
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = float(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} must be a number, got {value!r}") from exc
+    else:
+        raise ValueError(f"{field} must be a number, got {value!r}")
     if ge is not None and result is not None and result < ge:
         raise ValueError(f"{field} must be >= {ge}, got {result}")
     return result
@@ -187,6 +214,134 @@ def _resolve_limit(limit: str | int | None, max_results: str | int | None) -> in
     return min(resolved or 10, 200)
 
 
+# ISO 4217 currency for each eBay marketplace ID this server might plausibly
+# be pointed at via EBAY_MARKETPLACE. The Browse API's price-range filter
+# requires an accompanying ``priceCurrency`` and never infers one from the
+# marketplace header itself, so min_price/max_price need a currency from
+# *somewhere*. Money is not a field worth guessing at: a marketplace missing
+# from this table raises (see _price_currency below) instead of silently
+# attaching the wrong currency, which could zero out the search or — worse —
+# silently filter a different currency than the caller typed. Extend this
+# table before pointing EBAY_MARKETPLACE at a marketplace not listed here.
+_MARKETPLACE_CURRENCY: dict[str, str] = {
+    "EBAY_US": "USD",
+    "EBAY_GB": "GBP",
+    "EBAY_DE": "EUR",
+    "EBAY_AT": "EUR",
+    "EBAY_CH": "CHF",
+    "EBAY_FR": "EUR",
+    "EBAY_IT": "EUR",
+    "EBAY_ES": "EUR",
+    "EBAY_NL": "EUR",
+    "EBAY_BE": "EUR",
+    "EBAY_IE": "EUR",
+    "EBAY_AU": "AUD",
+    "EBAY_CA": "CAD",
+}
+
+
+def _price_currency() -> str:
+    """Resolve the ISO currency to pair with a min_price/max_price filter.
+
+    Looked up from the configured ``MARKETPLACE`` (see ebay_client.py, set via
+    ``EBAY_MARKETPLACE`` and defaulting to ``EBAY_DE``) rather than hardcoded,
+    so a deployment pointed at a different marketplace filters in that
+    marketplace's currency instead of silently mislabeling it as EUR.
+    """
+    try:
+        return _MARKETPLACE_CURRENCY[MARKETPLACE]
+    except KeyError:
+        raise ValueError(
+            f"no known currency for marketplace {MARKETPLACE!r}; add it to "
+            "_MARKETPLACE_CURRENCY in server.py before using min_price/"
+            "max_price on this marketplace, or pass a full "
+            "'price:[min..max],priceCurrency:<code>' filter via filter_expr "
+            "instead"
+        ) from None
+
+
+# Matches a `price` filter *key* right at the start of filter_expr or right
+# after a comma — not "priceCurrency", whose extra characters between "price"
+# and ":" fail the \s*: requirement immediately after "price". This is the
+# substring trap called out in the task: a filter_expr that only sets
+# priceCurrency (no range) must NOT be treated as a pre-existing price filter
+# by *this* regex — _PRICE_CURRENCY_FILTER_RE below is what catches that case.
+_PRICE_FILTER_RE = re.compile(r"(?i)(?:^|,)\s*price\s*:")
+
+# Matches a `priceCurrency` filter *key*, same anchoring as _PRICE_FILTER_RE.
+# The literal "Currency" right after "price" means this can never match a
+# bare `price:[...]` range (which has "[" right after "price", not "C"), so
+# the two regexes are mutually exclusive by construction — neither can trip
+# on the other's key.
+_PRICE_CURRENCY_FILTER_RE = re.compile(r"(?i)(?:^|,)\s*priceCurrency\s*:")
+
+
+def _resolve_price_filter(
+    min_price: float | None, max_price: float | None, filter_expr: str | None
+) -> str | None:
+    """Fold min_price/max_price into filter_expr as a Browse API price range.
+
+    Shaped like _resolve_limit above: two ways to say the same thing, so a
+    combination that could silently pick a winner instead raises. Here that
+    means a caller-supplied `price:[...]` or `priceCurrency:...` filter *and*
+    min_price/max_price at the same time — resolving that silently would
+    either drop a constraint the caller wrote, or (for priceCurrency
+    specifically) emit two conflicting `priceCurrency` keys in one filter
+    string, which is malformed and leaves it ambiguous which currency the
+    Browse API would honour.
+
+    The Browse API's price filter is an open-ended range — `price:[100..]`
+    (min only), `price:[..500]` (max only), `price:[100..500]` (both) — and a
+    price filter always requires an accompanying `priceCurrency`, which has no
+    default and is looked up via _price_currency() above. Because
+    `priceCurrency` is only ever meaningful alongside a price range, a caller
+    who set it is expressing price through filter_expr, so it gets the same
+    "raise, don't reconcile" treatment as an explicit `price:` filter — this
+    check only runs when we're about to add our own derived filter (i.e.
+    min_price or max_price was given); with neither given, filter_expr
+    (including a lone priceCurrency) passes through untouched below.
+    """
+    if min_price is None and max_price is None:
+        return filter_expr
+    if filter_expr and _PRICE_FILTER_RE.search(filter_expr):
+        raise ValueError(
+            "filter_expr already contains a `price` filter and min_price/"
+            f"max_price were also given (min_price={min_price!r}, "
+            f"max_price={max_price!r}); express the price range in one place "
+            "only — either filter_expr's price:[...] or min_price/max_price, "
+            "not both"
+        )
+    if filter_expr and _PRICE_CURRENCY_FILTER_RE.search(filter_expr):
+        raise ValueError(
+            "filter_expr already contains a `priceCurrency` filter and "
+            f"min_price/max_price were also given (min_price={min_price!r}, "
+            f"max_price={max_price!r}); a price range always carries its own "
+            "priceCurrency, so express it in one place only — either "
+            "filter_expr's price:[...],priceCurrency:... or min_price/"
+            "max_price, not both"
+        )
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise ValueError(
+            f"min_price ({min_price}) is greater than max_price ({max_price})"
+        )
+    low = "" if min_price is None else _format_price(min_price)
+    high = "" if max_price is None else _format_price(max_price)
+    price_filter = f"price:[{low}..{high}],priceCurrency:{_price_currency()}"
+    return f"{filter_expr},{price_filter}" if filter_expr else price_filter
+
+
+def _format_price(value: float) -> str:
+    """Render a coerced price without a spurious trailing ``.0``.
+
+    100, "100" and 100.0 all coerce to the float 100.0 (see _coerce_float);
+    without this, only the last of those would render as "price:[100..]" —
+    the other two would produce "price:[100.0..]", which is functionally
+    identical to the Browse API but makes the log line below noisier for no
+    reason.
+    """
+    return str(int(value)) if value == int(value) else str(value)
+
+
 def _shape_summaries(raw: dict[str, Any]) -> list[dict[str, Any]]:
     """Trim a Browse API search response down to what a model needs.
 
@@ -247,10 +402,35 @@ def search_ebay(
         Field(
             description=(
                 "eBay Browse API filter syntax, comma-separated. Examples: "
-                "'price:[100..500],priceCurrency:EUR' (price range), "
-                "'conditions:{NEW}' (new only), "
+                "'price:[100..500],priceCurrency:EUR' (price range — prefer "
+                "`min_price`/`max_price` below instead of writing this by "
+                "hand), 'conditions:{NEW}' (new only), "
                 "'buyingOptions:{FIXED_PRICE}' (Buy It Now only), "
-                "'itemLocationCountry:DE' (German sellers only)."
+                "'itemLocationCountry:DE' (German sellers only). Do not "
+                "combine a `price` or `priceCurrency` filter here with "
+                "`min_price`/`max_price` — pick one or the other."
+            )
+        ),
+    ] = None,
+    min_price: Annotated[
+        str | int | float | None,
+        Field(
+            description=(
+                "Minimum price, in the configured marketplace's currency "
+                "(e.g. EUR on EBAY_DE). Convenience over hand-writing "
+                "filter_expr's 'price:[min..],priceCurrency:...' range — do "
+                "not also set a `price` or `priceCurrency` filter in "
+                "filter_expr, that raises an error."
+            )
+        ),
+    ] = None,
+    max_price: Annotated[
+        str | int | float | None,
+        Field(
+            description=(
+                "Maximum price, in the configured marketplace's currency. "
+                "See `min_price` — same rule: don't combine with a `price` "
+                "or `priceCurrency` filter in filter_expr."
             )
         ),
     ] = None,
@@ -273,10 +453,16 @@ def search_ebay(
     Returns listing summaries — id, title, price, condition, seller reputation,
     location, thumbnail and URL. Pass an item's `item_id` to `get_item_details`
     for the full record. Prices and currency follow the configured marketplace.
+    `min_price`/`max_price` are a convenience over `filter_expr`'s `price`
+    range syntax — see those parameters' own descriptions for the rule against
+    combining the two.
     """
     resolved_limit = _resolve_limit(limit, max_results)
+    min_price = _coerce_float(min_price, "min_price", ge=0)
+    max_price = _coerce_float(max_price, "max_price", ge=0)
+    resolved_filter_expr = _resolve_price_filter(min_price, max_price, filter_expr)
     raw = search_items(
-        query=query, limit=resolved_limit, filter_expr=filter_expr, sort=sort
+        query=query, limit=resolved_limit, filter_expr=resolved_filter_expr, sort=sort
     )
     total = raw.get("total", 0)
 
@@ -291,8 +477,16 @@ def search_ebay(
     if total == 0 and len(tokens) >= 3:
         narrowed = _narrow_query(query)
         if narrowed.split() != tokens:
+            # filter_expr here is resolved_filter_expr, not the caller's raw
+            # filter_expr — the retry must carry the derived price filter
+            # exactly as the first call had it. Silently dropping it on
+            # fallback would return results the caller explicitly excluded
+            # with min_price/max_price.
             fallback_raw = search_items(
-                query=narrowed, limit=resolved_limit, filter_expr=filter_expr, sort=sort
+                query=narrowed,
+                limit=resolved_limit,
+                filter_expr=resolved_filter_expr,
+                sort=sort,
             )
             fallback_query = narrowed
             fallback_total = fallback_raw.get("total", 0)
@@ -318,7 +512,7 @@ def search_ebay(
     log.info(
         "search_ebay query=%r filter_expr=%r limit=%s total=%s fallback_query=%r",
         query,
-        filter_expr,
+        resolved_filter_expr,
         resolved_limit,
         total,
         fallback_query,

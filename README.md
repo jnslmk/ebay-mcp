@@ -21,7 +21,7 @@ bot-detection fragility.
 
 | Tool | What it does |
 |------|--------------|
-| `search_ebay` | Search by keyword with optional filters (price, condition, buying option, seller country) and sort. Returns listing summaries + `item_id`s. `query` is ANDed against the listing title only, so it wants 2-4 short product keywords, not a sentence — a zero-result response explains why and may already include one narrowed retry. |
+| `search_ebay` | Search by keyword with optional `min_price`/`max_price` (or a raw price filter via `filter_expr` — not both) plus condition, buying option and seller-country filters, and sort. Returns listing summaries + `item_id`s. `query` is ANDed against the listing title only, so it wants 2-4 short product keywords, not a sentence — a zero-result response explains why and may already include one narrowed retry (which preserves any price filter). |
 | `get_item_details` | Full record for one `item_id`: description, item specifics, images, shipping options, return terms, seller. |
 
 ## Configuration
