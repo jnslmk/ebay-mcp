@@ -46,6 +46,9 @@ _token_lock = threading.Lock()
 # Process-level session: one connection pool reused across token/search/item
 # calls, with a consistent browser-like default header set. Per-request
 # headers (_headers) are merged on top of these by requests.
+# Thread-safety caveat: the sync tools run in a thread pool, but this session
+# (and the module's cookie jar) is written for single-threaded use — requests
+# only guarantees thread-safe connection pooling, not cookie state.
 _session = requests.Session()
 _session.headers.update(
     {
@@ -58,7 +61,10 @@ _session.headers.update(
 )
 
 _MAX_ATTEMPTS = 4
-_BACKOFF_CAP = 8.0
+# Ceiling applied to both the exponential backoff and a server-sent Retry-After.
+# Configurable for servers that legitimately ask for longer waits; the default
+# still protects against pathological values (Retry-After measured in hours).
+_RETRY_CAP = float(os.environ.get("EBAY_RETRY_CAP", "8"))
 
 
 def _retry_delay(attempt: int, response: Optional[requests.Response]) -> float:
@@ -77,8 +83,8 @@ def _retry_delay(attempt: int, response: Optional[requests.Response]) -> float:
                 except (TypeError, ValueError):
                     retry_after = None
     if retry_after is None:
-        retry_after = min(_BACKOFF_CAP, 0.5 * 2**attempt)
-    return min(_BACKOFF_CAP, retry_after) + random.uniform(0, 0.25)
+        retry_after = min(_RETRY_CAP, 0.5 * 2**attempt)
+    return min(_RETRY_CAP, retry_after) + random.uniform(0, 0.25)
 
 
 def _request(

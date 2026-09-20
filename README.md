@@ -34,6 +34,7 @@ Set an eBay Developer keyset (free — <https://developer.ebay.com/my/keys>):
 | `EBAY_CLIENT_SECRET` | — | Cert ID (Client Secret) from your keyset |
 | `EBAY_MARKETPLACE` | `EBAY_DE` | Marketplace: `EBAY_DE`, `EBAY_US`, `EBAY_GB`, … |
 | `EBAY_ENV` | `sandbox` | `sandbox` or `production` |
+| `EBAY_RETRY_CAP` | `8` | Upper bound (seconds) on retry sleeps, including a server-sent `Retry-After` |
 | `MCP_TRANSPORT` | `http` | `http` (streamable-HTTP) or `stdio` |
 | `MCP_HOST` / `MCP_PORT` / `MCP_PATH` | `0.0.0.0` / `8000` / `/mcp` | HTTP bind |
 
