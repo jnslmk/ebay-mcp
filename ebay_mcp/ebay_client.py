@@ -7,7 +7,9 @@ upstream's — the fork adds an HTTP transport and container packaging on top
 """
 from __future__ import annotations
 
+import email.utils
 import os
+import random
 import threading
 import time
 from typing import Optional
@@ -41,6 +43,69 @@ _token_cache: dict[str, object] = {"value": None, "expires_at": 0.0}
 # token request, not one per call (token endpoints are rate-limited too).
 _token_lock = threading.Lock()
 
+# Process-level session: one connection pool reused across token/search/item
+# calls, with a consistent browser-like default header set. Per-request
+# headers (_headers) are merged on top of these by requests.
+_session = requests.Session()
+_session.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+    }
+)
+
+_MAX_ATTEMPTS = 4
+_BACKOFF_CAP = 8.0
+
+
+def _retry_delay(attempt: int, response: Optional[requests.Response]) -> float:
+    """Sleep delay after a failed attempt: Retry-After if given, else
+    jittered exponential backoff."""
+    retry_after: Optional[float] = None
+    if response is not None:
+        raw = response.headers.get("Retry-After")
+        if raw:
+            try:
+                retry_after = max(0.0, float(raw))
+            except ValueError:
+                try:
+                    target = email.utils.parsedate_to_datetime(raw)
+                    retry_after = max(0.0, target.timestamp() - time.time())
+                except (TypeError, ValueError):
+                    retry_after = None
+    if retry_after is None:
+        retry_after = min(_BACKOFF_CAP, 0.5 * 2**attempt)
+    return min(_BACKOFF_CAP, retry_after) + random.uniform(0, 0.25)
+
+
+def _request(
+    method: str, url: str, *, context: str, **kwargs: object
+) -> requests.Response:
+    """Run one HTTP request with bounded retries on 429/5xx.
+
+    Retries transient status codes with jittered exponential backoff,
+    honoring a numeric or HTTP-date ``Retry-After`` header. Non-transient
+    failures raise a RuntimeError with response context (single attempt,
+    no retry loop)."""
+    kwargs.setdefault("timeout", 15)
+    for attempt in range(_MAX_ATTEMPTS):
+        response = _session.request(method, url, **kwargs)  # type: ignore[arg-type]
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < _MAX_ATTEMPTS - 1:
+            time.sleep(_retry_delay(attempt, response))
+            continue
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(
+                f"{context} failed ({response.status_code}): {response.text[:500]}"
+            ) from exc
+        return response
+    # Unreachable: the loop either returns or raises on its final attempt.
+    raise RuntimeError(f"{context} failed after {_MAX_ATTEMPTS} attempts")  # pragma: no cover
+
 
 def credentials_configured() -> bool:
     """Whether a keyset is present. Used by the container readiness probe."""
@@ -66,8 +131,10 @@ def _get_access_token() -> str:
         now = time.time()
         if _token_cache["value"] and now < _token_cache["expires_at"]:  # type: ignore[operator]
             return _token_cache["value"]  # type: ignore[return-value]
-        response = requests.post(
+        response = _request(
+            "post",
             TOKEN_URL,
+            context="Token request",
             auth=(CLIENT_ID, CLIENT_SECRET),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             data={
@@ -76,10 +143,6 @@ def _get_access_token() -> str:
             },
             timeout=10,
         )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Token request failed ({response.status_code}): {response.text[:300]}"
-            )
         payload = response.json()
         _token_cache["value"] = payload["access_token"]
         # 60s safety margin before actual expiry.
@@ -112,13 +175,9 @@ def search_items(
         params["sort"] = sort
 
     token = _get_access_token()
-    response = requests.get(
-        SEARCH_URL, headers=_headers(token), params=params, timeout=15
+    response = _request(
+        "get", SEARCH_URL, context="Search", headers=_headers(token), params=params
     )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Search failed ({response.status_code}): {response.text[:500]}"
-        )
     return response.json()
 
 
@@ -135,11 +194,9 @@ def get_item(item_id: str, fieldgroups: Optional[str] = None) -> dict:
         params["fieldgroups"] = fieldgroups
 
     token = _get_access_token()
-    response = requests.get(url, headers=_headers(token), params=params, timeout=15)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"getItem failed ({response.status_code}): {response.text[:500]}"
-        )
+    response = _request(
+        "get", url, context="getItem", headers=_headers(token), params=params
+    )
     return response.json()
 
 
