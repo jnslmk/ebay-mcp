@@ -64,7 +64,10 @@ _MAX_ATTEMPTS = 4
 # Ceiling applied to both the exponential backoff and a server-sent Retry-After.
 # Configurable for servers that legitimately ask for longer waits; the default
 # still protects against pathological values (Retry-After measured in hours).
-_RETRY_CAP = float(os.environ.get("EBAY_RETRY_CAP", "8"))
+try:
+    _RETRY_CAP = float(os.environ.get("EBAY_RETRY_CAP", "8"))
+except ValueError:
+    _RETRY_CAP = 8.0
 
 
 def _retry_delay(attempt: int, response: Optional[requests.Response]) -> float:
